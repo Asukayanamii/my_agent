@@ -14,6 +14,7 @@
   但**超过上限就直接失败并说明原因**，不静默等几分钟（Pi 的 `validateServerRetryDelayMs`）。
 - **已经吐过字的调用不重试**：前端没法把已经渲染的半截回答撤回去，重试只会把它再拉一遍，
   看起来像答了两遍。要支持得先有"重置本轮文本"的事件，见 LESSONS。
+  **例外是"流被掐断"**（`stream_was_interrupted`）：残句本来就该丢，重试补的是本来拿不到的结果。
 """
 
 import asyncio
@@ -91,6 +92,31 @@ RETRYABLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+INTERRUPTED_STREAM_PATTERN = re.compile(
+    "|".join(
+        [
+            # langchain-openai 的停顿看门狗：连续 N 秒收不到新分片就抛。
+            # 网关会静默停顿超过默认的 120s（TCP 还活着，只是不再往下发分片）。
+            "streamchunktimeout",
+            "no streaming chunk received",
+            # 传输层断在半路（各家说法）
+            "stream ended before",
+            "ended without",
+            "did not get a response",
+            "incomplete",
+            "premature",
+            "connection reset",
+            "connection lost",
+            "other side closed",
+            "socket hang up",
+            "peer closed",
+            "unexpected eof",
+            "response payload is not completed",
+        ]
+    ),
+    re.IGNORECASE,
+)
+
 RETRYABLE_STATUS = frozenset({408, 409, 429})
 
 _sleep = asyncio.sleep
@@ -133,16 +159,34 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     return None
 
 
+def stream_was_interrupted(exc: BaseException) -> bool:
+    """
+    这次失败是不是"流断在半路"——也就是已经吐出的内容是**残句**。
+
+    "吐过字就不重试"防的是把**一句完整的回答**拉两遍（前端撤不回去）。流被掐断不在这个范围里：
+    残句本来就要丢掉，而且抛异常时那个 `AIMessage` 根本没构造出来、工具也没执行——
+    重试不会重复任何副作用，只会补上那个本来拿不到的结果。
+    """
+    return bool(INTERRUPTED_STREAM_PATTERN.search(f"{type(exc).__name__}: {exc}"))
+
+
 def is_retryable(exc: BaseException) -> bool:
     """
     这次失败值不值得重试。
 
     先看配额/计费（**不可重试优先**——限流常被网关报成 429，但"额度用完"的 429 重试没意义），
-    再看 HTTP 状态，最后按错误文本判断。
+    再看是不是"流被掐断"（见 `stream_was_interrupted`），最后看 HTTP 状态，再按错误文本判断。
+
+    流中断要单独判一次、不能只靠 `RETRYABLE_PATTERN`：langchain-openai 那条
+    `StreamChunkTimeoutError` 能被认出**只是因为类名里恰好带 "timeout"**，
+    消息本身（"No streaming chunk received for 120.0s"）一个可重试词都不含。
+    换个类名、同样的措辞就会被判成不可重试、当场失败——这层不能靠巧合。
     """
     text = f"{type(exc).__name__}: {exc}"
     if NON_RETRYABLE_PATTERN.search(text):
         return False
+    if stream_was_interrupted(exc):
+        return True
 
     status = _status_of(exc)
     if status is not None:
@@ -228,7 +272,7 @@ async def ainvoke_with_retry(
         except Exception as exc:
             if attempt > MAX_RETRIES or not is_retryable(exc):
                 raise
-            if spy.seen:
+            if spy.seen and not stream_was_interrupted(exc):
                 logger.warning(
                     "%s 失败但已经吐出内容，不再重试（重试会把半截回答再拉一遍）"
                     " thread=%s：%s",
