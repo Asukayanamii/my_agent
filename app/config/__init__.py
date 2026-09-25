@@ -82,6 +82,18 @@ def _ratio_or(raw: str, default: float) -> float:
     return value
 
 
+# ---- 流式调用的停顿看门狗 ----
+# langchain-openai 默认 120s：连续这么久收不到新分片就抛 StreamChunkTimeoutError。
+# 实测网关会静默停顿超过 120s（TCP 连接还活着，只是不再往下发分片），太紧。
+# 放宽到 300s；填 0/off/none 关掉看门狗，交给内核级 TCP 超时兜底。
+_RAW_CHUNK_TIMEOUT = os.getenv("LLM_STREAM_CHUNK_TIMEOUT", "").strip().lower()
+LLM_STREAM_CHUNK_TIMEOUT: int | None = (
+    None
+    if _RAW_CHUNK_TIMEOUT in {"0", "off", "none", "disable", "disabled"}
+    else _int_or(_RAW_CHUNK_TIMEOUT, 300)
+)
+
+
 # ---- 上下文自动压缩 ----
 # 窗口这个数只能由用户给：provider 一般不报（DeepSeek 的 /v1/models 只有 id/owned_by），
 # 我们也学不来 Pi 那种"生成式模型目录"（没有构建步骤，base_url 可指向任意兼容端点）。

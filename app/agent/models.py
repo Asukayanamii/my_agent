@@ -17,6 +17,7 @@ from app.config import (
     LLM_BASE_URL,
     LLM_CONTEXT_WINDOW,
     LLM_MODEL,
+    LLM_STREAM_CHUNK_TIMEOUT,
 )
 from app.exceptions import ModelUnavailable
 
@@ -100,6 +101,9 @@ def build_model(name: str | None = None, max_tokens: int | None = None) -> BaseC
         # SDK 自带的重试关掉：它不记日志、延迟不可控，还会和我们那层叠加次数
         # （3 × 2 次）。重试统一由 app/agent/retry.py 负责，理由见那里。
         max_retries=0,
+        # 流式停顿看门狗：SDK 默认 120s 太紧，网关一次静默停顿就会让这一路调用直接失败
+        # （见 app/config 里的 LLM_STREAM_CHUNK_TIMEOUT）。
+        stream_chunk_timeout=LLM_STREAM_CHUNK_TIMEOUT,
     )
 
 
